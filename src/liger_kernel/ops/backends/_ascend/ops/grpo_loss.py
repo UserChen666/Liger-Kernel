@@ -214,7 +214,9 @@ def _grpo_loss_fwd_kernel(
                 is_clipped = (coef_1 > EPS_HIGH) & (advantage > 0)
 
             elif LOSS_TYPE == 2:  # SAPO
-                temperature = tl.where(advantage > 0, SAPO_TEMP_POS, SAPO_TEMP_NEG)
+                # Branchless scalar selection: neg + cond * (pos - neg), avoids SIMD divergence
+                sapo_cond = (advantage > 0).to(tl.float32)
+                temperature = SAPO_TEMP_NEG + (SAPO_TEMP_POS - SAPO_TEMP_NEG) * sapo_cond
                 sigmoid_input = temperature * (coef_1 - 1.0)
                 sapo_coef = tl.sigmoid(sigmoid_input) * 4.0 / temperature
                 per_token_loss = -sapo_coef * advantage
@@ -447,7 +449,9 @@ def _grpo_loss_bwd_kernel_seq(
                 cols = start_n + tl.arange(0, BLOCK_N)
                 logits = tl.load(LOGITS_local + cols, mask=cols < N, other=-float("inf")).to(tl.float32) / TEMPERATURE
                 probs = tl.exp(logits - lse)
-                dlogits = tl.where(cols == idx, 1 - probs, -probs) * dlogp
+                # Branchless vectorized selection: cond - probs = cond*(1-probs) + (1-cond)*(-probs)
+                cond = (cols == idx).to(tl.float32)
+                dlogits = (cond - probs) * dlogp
                 tl.store(DLOGITS_local + cols, dlogits, mask=cols < N)
 
 
@@ -543,7 +547,9 @@ def _grpo_loss_bwd_kernel(
                 dlogp = -coef_2 * advantage
 
             elif LOSS_TYPE == 2:  # SAPO
-                temperature = tl.where(advantage > 0, SAPO_TEMP_POS, SAPO_TEMP_NEG)
+                # Branchless scalar selection: neg + cond * (pos - neg), avoids SIMD divergence
+                sapo_cond = (advantage > 0).to(tl.float32)
+                temperature = SAPO_TEMP_NEG + (SAPO_TEMP_POS - SAPO_TEMP_NEG) * sapo_cond
                 sigmoid_input = temperature * (coef_1 - 1.0)
                 sigmoid_val = tl.sigmoid(sigmoid_input)
                 d_sapo_d_coef1 = 4.0 * sigmoid_val * (1.0 - sigmoid_val)
@@ -569,7 +575,9 @@ def _grpo_loss_bwd_kernel(
                 cols = start_n + tl.arange(0, BLOCK_N)
                 logits = tl.load(LOGITS_local + cols, mask=cols < N, other=-float("inf")).to(tl.float32) / TEMPERATURE
                 probs = tl.exp(logits - lse)
-                dlogits = tl.where(cols == idx, 1 - probs, -probs) * dlogp
+                # Branchless vectorized selection: cond - probs = cond*(1-probs) + (1-cond)*(-probs)
+                cond = (cols == idx).to(tl.float32)
+                dlogits = (cond - probs) * dlogp
                 tl.store(DLOGITS_local + cols, dlogits, mask=cols < N)
 
 
