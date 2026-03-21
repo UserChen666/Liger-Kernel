@@ -24,48 +24,77 @@ _str_to_loss_type = {
 
 
 def calculate_tile_count_2d(batch_size, seq_len, num_cores):
-    """Compute optimal grid configuration for parallel processing."""
+    """Compute optimal grid configuration for parallel processing.
+
+    Key optimization: avoid forcing grid_seq to 1 when total exceeds num_cores,
+    because a grid_seq of 1 means each program processes ALL tokens sequentially
+    via the grid-stride token loop, incurring massive scalar overhead from repeated
+    integer division/modulo (token_idx // L, token_idx % L) per iteration.
+
+    Strategy: when total exceeds num_cores, reduce grid_batch first (cap it),
+    rather than reducing grid_seq to 1.
+    """
     grid_batch = batch_size
-    cores_per_sample = min(seq_len, num_cores // batch_size)
-    cores_per_sample = max(1, cores_per_sample)
-    grid_seq = cores_per_sample
-    total = grid_batch * grid_seq
-    if total > num_cores:
-        grid_seq = max(1, num_cores // grid_batch)
+    grid_seq = 1
+
+    # Compute total programs needed: batch_size * seq_len / num_progs_l
+    # Each program ideally handles 1 token, so total_programs = batch_size * seq_len
+    total_programs = batch_size * seq_len
+
+    if total_programs <= num_cores:
+        # Enough cores: 1 core per token, no grid-stride needed
+        grid_batch = batch_size
+        grid_seq = seq_len
+    elif num_cores >= batch_size:
+        # Medium case: allocate all remaining cores to seq dimension
+        grid_batch = batch_size
+        grid_seq = max(1, num_cores // batch_size)
+    else:
+        # Few cores: first fill batch dimension, remainder goes to seq
+        grid_batch = num_cores
+        grid_seq = 1
+
     return (grid_batch, grid_seq)
 
 
-def compute_block_size_softmax(seq_vocab_size):
-    """Determine optimal block size for selective log-softmax kernel."""
-    multiplier = 6.0
+def compute_block_size(seq_vocab_size, purpose="forward"):
+    """Determine optimal BLOCK_N via compute_default_tiling_strategy.
+
+    When N <= 2048: use next_power_of_2(N) as BLOCK_N.
+    This ensures the kernel loads all vocab elements in a single pass (single block),
+    which is the most efficient on NPU for small vocab sizes.
+
+    Memory multipliers:
+      - softmax:   6.0 blocks (load logits)
+      - forward:  10.0 blocks (+ store loss/lse/kl)
+      - backward: 12.0 blocks (+ load dloss, store dlogits)
+    """
+    multipliers = {"softmax": 6.0, "forward": 10.0, "backward": 12.0}
+    multiplier = multipliers.get(purpose, 10.0)
+
+    # For small vocab: single-pass is optimal
+    if seq_vocab_size <= 2048:
+        return triton.next_power_of_2(seq_vocab_size)
+
     tile_shapes = compute_default_tiling_strategy(
-        safety_margin=0.9, dtype_size=4, memory_multiplier=multiplier, shapes=((seq_vocab_size,),), tiling_dims=(0,)
+        safety_margin=0.9, dtype_size=4, memory_multiplier=multiplier,
+        shapes=((seq_vocab_size,),), tiling_dims=(0,)
     )
     if tile_shapes and len(tile_shapes) > 0:
-        return tile_shapes[0][0]
+        return max(2048, tile_shapes[0][0])
     return 2048
+
+
+def compute_block_size_softmax(seq_vocab_size):
+    return compute_block_size(seq_vocab_size, "softmax")
 
 
 def compute_block_size_forward(seq_vocab_size):
-    """Determine optimal block size for forward pass kernel."""
-    multiplier = 10.0
-    tile_shapes = compute_default_tiling_strategy(
-        safety_margin=0.9, dtype_size=4, memory_multiplier=multiplier, shapes=((seq_vocab_size,),), tiling_dims=(0,)
-    )
-    if tile_shapes and len(tile_shapes) > 0:
-        return tile_shapes[0][0]
-    return 2048
+    return compute_block_size(seq_vocab_size, "forward")
 
 
 def compute_block_size_backward(seq_vocab_size):
-    """Determine optimal block size for backward pass kernel."""
-    multiplier = 12.0
-    tile_shapes = compute_default_tiling_strategy(
-        safety_margin=0.9, dtype_size=4, memory_multiplier=multiplier, shapes=((seq_vocab_size,),), tiling_dims=(0,)
-    )
-    if tile_shapes and len(tile_shapes) > 0:
-        return tile_shapes[0][0]
-    return 2048
+    return compute_block_size(seq_vocab_size, "backward")
 
 
 @triton.jit
@@ -106,8 +135,9 @@ def _selective_log_softmax_kernel(
 
             m_i = float("-inf")
             l_i = 0.0
+            base_offsets = tl.arange(0, BLOCK_N)
             for start in range(0, N, BLOCK_N):
-                cols = start + tl.arange(0, BLOCK_N)
+                cols = start + base_offsets
                 logits = tl.load(LOGITS_local + cols, mask=cols < N, other=float("-inf")).to(tl.float32) / TEMPERATURE
                 new_m_i = tl.maximum(m_i, tl.max(logits))
                 alpha = tl.exp(m_i - new_m_i)
@@ -174,11 +204,12 @@ def _grpo_loss_fwd_kernel(
             LOSS_local = LOSS + token_idx
             LSE_local = LSE + token_idx
             IS_CLIPPED_local = IS_CLIPPED + token_idx
+            base_offsets = tl.arange(0, BLOCK_N)
 
             m_i = float("-inf")
             l_i = 0.0
             for start in range(0, N, BLOCK_N):
-                cols = start + tl.arange(0, BLOCK_N)
+                cols = start + base_offsets
                 logits = tl.load(LOGITS_local + cols, mask=cols < N, other=float("-inf")).to(tl.float32) / TEMPERATURE
                 new_m_i = tl.maximum(m_i, tl.max(logits))
                 alpha = tl.exp(m_i - new_m_i)
@@ -296,11 +327,12 @@ def _grpo_loss_fwd_kernel_seq(
             LOSS_local = LOSS + token_idx
             LSE_local = LSE + token_idx
             IS_CLIPPED_local = IS_CLIPPED + token_idx
+            base_offsets = tl.arange(0, BLOCK_N)
 
             m_i = float("-inf")
             l_i = 0.0
             for start in range(0, N, BLOCK_N):
-                cols = start + tl.arange(0, BLOCK_N)
+                cols = start + base_offsets
                 logits = tl.load(LOGITS_local + cols, mask=cols < N, other=float("-inf")).to(tl.float32) / TEMPERATURE
                 new_m_i = tl.maximum(m_i, tl.max(logits))
                 alpha = tl.exp(m_i - new_m_i)
@@ -393,9 +425,10 @@ def _grpo_loss_bwd_kernel_seq(
             not_skip = tl.load(COMPLETION_MASK_local)
             should_process = not_skip
 
+        base_offsets = tl.arange(0, BLOCK_N)
         if should_process == 0:
             for start in range(0, N, BLOCK_N):
-                cols = tl.arange(0, BLOCK_N) + start
+                cols = base_offsets + start
                 tl.store(DLOGITS_local + cols, 0.0, mask=cols < N)
         else:
             LOGITS_local = LOGITS + off_b * (L + 1) * N + off_l * N
@@ -446,7 +479,7 @@ def _grpo_loss_bwd_kernel_seq(
 
             dlogp = dlogp / TEMPERATURE
             for start_n in tl.range(0, N, BLOCK_N):
-                cols = start_n + tl.arange(0, BLOCK_N)
+                cols = start_n + base_offsets
                 logits = tl.load(LOGITS_local + cols, mask=cols < N, other=-float("inf")).to(tl.float32) / TEMPERATURE
                 probs = tl.exp(logits - lse)
                 # Branchless vectorized selection: cond - probs = cond*(1-probs) + (1-cond)*(-probs)
@@ -504,9 +537,10 @@ def _grpo_loss_bwd_kernel(
             not_skip = tl.load(COMPLETION_MASK_local)
             should_process = not_skip
 
+        base_offsets = tl.arange(0, BLOCK_N)
         if should_process == 0:
             for start in range(0, N, BLOCK_N):
-                cols = tl.arange(0, BLOCK_N) + start
+                cols = base_offsets + start
                 tl.store(DLOGITS_local + cols, 0.0, mask=cols < N)
         else:
             LOGITS_local = LOGITS + off_b * (L + 1) * N + off_l * N
@@ -570,9 +604,8 @@ def _grpo_loss_bwd_kernel(
                     dlogp += BETA * (1 - tl.exp(ref_logp - logp))
 
             dlogp = dlogp * dloss / TEMPERATURE
-            tl.debug_barrier()
             for start_n in tl.range(0, N, BLOCK_N):
-                cols = start_n + tl.arange(0, BLOCK_N)
+                cols = start_n + base_offsets
                 logits = tl.load(LOGITS_local + cols, mask=cols < N, other=-float("inf")).to(tl.float32) / TEMPERATURE
                 probs = tl.exp(logits - lse)
                 # Branchless vectorized selection: cond - probs = cond*(1-probs) + (1-cond)*(-probs)
