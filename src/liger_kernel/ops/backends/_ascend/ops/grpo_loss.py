@@ -196,7 +196,7 @@ def _grpo_loss_fwd_kernel(
             lse = m_i + tl.log(l_i)
 
             idx = tl.load(INPUT_IDS_local).to(tl.int32)
-            x = tl.load(LOGITS_local + idx).to(tl.float32) / TEMPERATURE
+            x = tl.load(LOGITS_local + idx).to(tl.float32) *inv_temp
             logp = x - lse
             if OLD_LOGP is None:
                 old_logp = logp
@@ -225,7 +225,7 @@ def _grpo_loss_fwd_kernel(
             elif LOSS_TYPE == 2:  # SAPO
                 temperature = tl.where(advantage > 0, SAPO_TEMP_POS, SAPO_TEMP_NEG)
                 sigmoid_input = temperature * (coef_1 - 1.0)
-                sapo_coef = tl.sigmoid(sigmoid_input) * 4.0 / temperature
+                sapo_coef = tl.sigmoid(sigmoid_input) * 4.0  * inv_temp
                 per_token_loss = -sapo_coef * advantage
                 is_clipped = 0.0
 
@@ -304,13 +304,15 @@ def _grpo_loss_fwd_kernel_seq(
             LSE_local = LSE + token_idx
             IS_CLIPPED_local = IS_CLIPPED + token_idx
 
+            inv_temp = tl.full((), 1.0 / TEMPERATURE, dtype=tl.float32)
+
             m_i = float("-inf")
             l_i = 0.0
             for start in range(0, N, BLOCK_N):
                 cols = start + tl.arange(0, BLOCK_N)
                 cols_cmp = cols.to(tl.float32)
                 logits = tl.load(LOGITS_local + cols, mask=cols_cmp < N, other=float("-inf")).to(
-                    tl.float32) / TEMPERATURE
+                    tl.float32) * inv_temp
                 new_m_i = tl.maximum(m_i, tl.max(logits))
                 alpha = tl.exp(m_i - new_m_i)
                 l_i = l_i * alpha + tl.sum(tl.exp(logits - new_m_i))
@@ -318,7 +320,7 @@ def _grpo_loss_fwd_kernel_seq(
             lse = m_i + tl.log(l_i)
 
             idx = tl.load(INPUT_IDS_local).to(tl.int32)
-            x = tl.load(LOGITS_local + idx).to(tl.float32) / TEMPERATURE
+            x = tl.load(LOGITS_local + idx).to(tl.float32) * inv_temp
             logp = x - lse
 
             coef_1 = tl.load(COEF_1_local).to(tl.float32)
@@ -424,7 +426,8 @@ def _grpo_loss_bwd_kernel_seq(
             seq_len = tl.load(SEQ_LEN_local).to(tl.float32)
 
             idx = tl.load(INPUT_IDS_local).to(tl.int32)
-            x = tl.load(LOGITS_local + idx).to(tl.float32) / TEMPERATURE
+            inv_temp = tl.full((), 1.0 / TEMPERATURE, dtype=tl.float32)
+            x = tl.load(LOGITS_local + idx).to(tl.float32) * inv_temp
             logp = x - lse
 
             advantage = tl.load(ADVANTAGES_local).to(tl.float32)
@@ -454,12 +457,12 @@ def _grpo_loss_bwd_kernel_seq(
                 else:
                     dlogp += BETA * (1 - tl.exp(ref_logp - logp)) * dloss
 
-            dlogp = dlogp / TEMPERATURE
+            dlogp = dlogp * inv_temp
             for start_n in tl.range(0, N, BLOCK_N):
                 cols = start_n + tl.arange(0, BLOCK_N)
                 cols_cmp = cols.to(tl.float32)
                 cols_cmp_n = cols_cmp < N
-                logits = tl.load(LOGITS_local + cols, mask=cols_cmp_n, other=-float("inf")).to(tl.float32) / TEMPERATURE
+                logits = tl.load(LOGITS_local + cols, mask=cols_cmp_n, other=-float("inf")).to(tl.float32) * inv_temp
                 probs = tl.exp(logits - lse)
                 cols_idx = cols == idx
                 dlogits = (cols_idx - probs) * dlogp
@@ -529,9 +532,10 @@ def _grpo_loss_bwd_kernel(
 
             dloss = tl.load(DLOSS_local).to(tl.float32)
             lse = tl.load(LSE_local).to(tl.float32)
+            inv_temp = tl.full((), 1.0 / TEMPERATURE, dtype=tl.float32)
 
             idx = tl.load(INPUT_IDS_local).to(tl.int32)
-            x = tl.load(LOGITS_local + idx).to(tl.float32) / TEMPERATURE
+            x = tl.load(LOGITS_local + idx).to(tl.float32) * inv_temp
             logp = x - lse
             if OLD_LOGP is None:
                 old_logp = logp
@@ -579,12 +583,12 @@ def _grpo_loss_bwd_kernel(
                 else:
                     dlogp += BETA * (1 - tl.exp(ref_logp - logp))
 
-            dlogp = dlogp * dloss / TEMPERATURE
+            dlogp = dlogp * dloss * inv_temp
             for start_n in tl.range(0, N, BLOCK_N):
                 cols = start_n + tl.arange(0, BLOCK_N)
                 cols_cmp = cols.to(tl.float32)
                 cols_cmp_n = cols_cmp < N
-                logits = tl.load(LOGITS_local + cols, mask=cols_cmp_n, other=-float("inf")).to(tl.float32) / TEMPERATURE
+                logits = tl.load(LOGITS_local + cols, mask=cols_cmp_n, other=-float("inf")).to(tl.float32) * inv_temp
                 probs = tl.exp(logits - lse)
                 cols_idx = cols == idx
                 dlogits = (cols_idx - probs) * dlogp
