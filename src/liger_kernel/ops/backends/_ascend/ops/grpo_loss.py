@@ -179,7 +179,9 @@ def _grpo_loss_fwd_kernel(
             l_i = 0.0
             for start in range(0, N, BLOCK_N):
                 cols = start + tl.arange(0, BLOCK_N)
-                logits = tl.load(LOGITS_local + cols, mask=cols < N, other=float("-inf")).to(tl.float32) / TEMPERATURE
+                cols_cmp = cols.to(tl.float32)
+                logits = tl.load(LOGITS_local + cols, mask=cols_cmp < N, other=float("-inf")).to(
+                    tl.float32) / TEMPERATURE
                 new_m_i = tl.maximum(m_i, tl.max(logits))
                 alpha = tl.exp(m_i - new_m_i)
                 l_i = l_i * alpha + tl.sum(tl.exp(logits - new_m_i))
@@ -299,7 +301,9 @@ def _grpo_loss_fwd_kernel_seq(
             l_i = 0.0
             for start in range(0, N, BLOCK_N):
                 cols = start + tl.arange(0, BLOCK_N)
-                logits = tl.load(LOGITS_local + cols, mask=cols < N, other=float("-inf")).to(tl.float32) / TEMPERATURE
+                cols_cmp = cols.to(tl.float32)
+                logits = tl.load(LOGITS_local + cols, mask=cols_cmp < N, other=float("-inf")).to(
+                    tl.float32) / TEMPERATURE
                 new_m_i = tl.maximum(m_i, tl.max(logits))
                 alpha = tl.exp(m_i - new_m_i)
                 l_i = l_i * alpha + tl.sum(tl.exp(logits - new_m_i))
@@ -394,7 +398,8 @@ def _grpo_loss_bwd_kernel_seq(
         if should_process == 0:
             for start in range(0, N, BLOCK_N):
                 cols = tl.arange(0, BLOCK_N) + start
-                tl.store(DLOGITS_local + cols, 0.0, mask=cols < N)
+                cols_cmp = cols.to(tl.float32)
+                tl.store(DLOGITS_local + cols, 0.0, mask=cols_cmp < N)
         else:
             LOGITS_local = LOGITS + off_b * (L + 1) * N + off_l * N
             DLOSS_local = DLOSS + off_b * loss_stride0 + off_l * loss_stride1
@@ -445,11 +450,13 @@ def _grpo_loss_bwd_kernel_seq(
             dlogp = dlogp / TEMPERATURE
             for start_n in tl.range(0, N, BLOCK_N):
                 cols = start_n + tl.arange(0, BLOCK_N)
-                logits = tl.load(LOGITS_local + cols, mask=cols < N, other=-float("inf")).to(tl.float32) / TEMPERATURE
+                cols_cmp = cols.to(tl.float32)
+                cols_cmp_n = cols_cmp < N
+                logits = tl.load(LOGITS_local + cols, mask=cols_cmp_n, other=-float("inf")).to(tl.float32) / TEMPERATURE
                 probs = tl.exp(logits - lse)
                 cols_idx = cols == idx
                 dlogits = (cols_idx - probs) * dlogp
-                tl.store(DLOGITS_local + cols, dlogits, mask=cols < N)
+                tl.store(DLOGITS_local + cols, dlogits, mask=cols_cmp_n)
 
 
 @triton.jit
@@ -504,7 +511,8 @@ def _grpo_loss_bwd_kernel(
         if should_process == 0:
             for start in range(0, N, BLOCK_N):
                 cols = tl.arange(0, BLOCK_N) + start
-                tl.store(DLOGITS_local + cols, 0.0, mask=cols < N)
+                cols_cmp = cols.to(tl.float32)
+                tl.store(DLOGITS_local + cols, 0.0, mask=cols_cmp < N)
         else:
             LOGITS_local = LOGITS + off_b * (L + 1) * N + off_l * N
             DLOSS_local = DLOSS + off_b * loss_stride0 + off_l * loss_stride1
@@ -567,11 +575,13 @@ def _grpo_loss_bwd_kernel(
             dlogp = dlogp * dloss / TEMPERATURE
             for start_n in tl.range(0, N, BLOCK_N):
                 cols = start_n + tl.arange(0, BLOCK_N)
-                logits = tl.load(LOGITS_local + cols, mask=cols < N, other=-float("inf")).to(tl.float32) / TEMPERATURE
+                cols_cmp = cols.to(tl.float32)
+                cols_cmp_n = cols_cmp < N
+                logits = tl.load(LOGITS_local + cols, mask=cols_cmp_n, other=-float("inf")).to(tl.float32) / TEMPERATURE
                 probs = tl.exp(logits - lse)
                 cols_idx = cols == idx
                 dlogits = (cols_idx - probs) * dlogp
-                tl.store(DLOGITS_local + cols, dlogits, mask=cols < N)
+                tl.store(DLOGITS_local + cols, dlogits, mask=cols_cmp_n)
 
 
 @torch.no_grad
