@@ -175,10 +175,8 @@ def _grpo_loss_fwd_kernel(
             LSE_local = LSE + token_idx
             IS_CLIPPED_local = IS_CLIPPED + token_idx
 
-            # === KERNEL 入口处预计算 ===
             inv_temp = tl.full((), 1.0 / TEMPERATURE, dtype=tl.float32)
 
-            # === LSE 计算循环 ===
             m_i = float("-inf")
             l_i = 0.0
             for start in range(0, N, BLOCK_N):
