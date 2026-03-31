@@ -156,6 +156,7 @@ def _grpo_loss_fwd_kernel(
     batch_end = batch_start + L
     start_token = batch_start + pid_l
     stride = num_progs_l
+    inv_temp = tl.full((), 1.0 / TEMPERATURE, dtype=tl.float32)
 
     for token_idx in tl.range(start_token, batch_end, stride):
         off_b = token_idx // L
@@ -174,8 +175,6 @@ def _grpo_loss_fwd_kernel(
             LOSS_local = LOSS + token_idx
             LSE_local = LSE + token_idx
             IS_CLIPPED_local = IS_CLIPPED + token_idx
-
-            inv_temp = tl.full((), 1.0 / TEMPERATURE, dtype=tl.float32)
 
             m_i = float("-inf")
             l_i = 0.0
@@ -196,7 +195,7 @@ def _grpo_loss_fwd_kernel(
             lse = m_i + tl.log(l_i)
 
             idx = tl.load(INPUT_IDS_local).to(tl.int32)
-            x = tl.load(LOGITS_local + idx).to(tl.float32) *inv_temp
+            x = tl.load(LOGITS_local + idx).to(tl.float32) * inv_temp
             logp = x - lse
             if OLD_LOGP is None:
                 old_logp = logp
@@ -225,7 +224,7 @@ def _grpo_loss_fwd_kernel(
             elif LOSS_TYPE == 2:  # SAPO
                 temperature = tl.where(advantage > 0, SAPO_TEMP_POS, SAPO_TEMP_NEG)
                 sigmoid_input = temperature * (coef_1 - 1.0)
-                sapo_coef = tl.sigmoid(sigmoid_input) * 4.0  * inv_temp
+                sapo_coef = tl.sigmoid(sigmoid_input) * 4.0 * inv_temp
                 per_token_loss = -sapo_coef * advantage
                 is_clipped = 0.0
 
@@ -282,6 +281,7 @@ def _grpo_loss_fwd_kernel_seq(
     batch_end = batch_start + L
     start_token = batch_start + pid_l
     stride = num_progs_l
+    inv_temp = tl.full((), 1.0 / TEMPERATURE, dtype=tl.float32)
 
     for token_idx in tl.range(start_token, batch_end, stride):
         off_b = token_idx // L
@@ -303,8 +303,6 @@ def _grpo_loss_fwd_kernel_seq(
             LOSS_local = LOSS + token_idx
             LSE_local = LSE + token_idx
             IS_CLIPPED_local = IS_CLIPPED + token_idx
-
-            inv_temp = tl.full((), 1.0 / TEMPERATURE, dtype=tl.float32)
 
             m_i = float("-inf")
             l_i = 0.0
@@ -391,6 +389,7 @@ def _grpo_loss_bwd_kernel_seq(
     batch_end = batch_start + L
     start_token = batch_start + pid_l
     stride = num_progs_l
+    inv_temp = tl.full((), 1.0 / TEMPERATURE, dtype=tl.float32)
 
     for token_idx in tl.range(start_token, batch_end, stride):
         off_b = token_idx // L
@@ -426,7 +425,6 @@ def _grpo_loss_bwd_kernel_seq(
             seq_len = tl.load(SEQ_LEN_local).to(tl.float32)
 
             idx = tl.load(INPUT_IDS_local).to(tl.int32)
-            inv_temp = tl.full((), 1.0 / TEMPERATURE, dtype=tl.float32)
             x = tl.load(LOGITS_local + idx).to(tl.float32) * inv_temp
             logp = x - lse
 
@@ -505,6 +503,7 @@ def _grpo_loss_bwd_kernel(
     batch_end = batch_start + L
     start_token = batch_start + pid_l
     stride = num_progs_l
+    inv_temp = tl.full((), 1.0 / TEMPERATURE, dtype=tl.float32)
 
     for token_idx in tl.range(start_token, batch_end, stride):
         off_b = token_idx // L
@@ -532,7 +531,6 @@ def _grpo_loss_bwd_kernel(
 
             dloss = tl.load(DLOSS_local).to(tl.float32)
             lse = tl.load(LSE_local).to(tl.float32)
-            inv_temp = tl.full((), 1.0 / TEMPERATURE, dtype=tl.float32)
 
             idx = tl.load(INPUT_IDS_local).to(tl.int32)
             x = tl.load(LOGITS_local + idx).to(tl.float32) * inv_temp
