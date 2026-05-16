@@ -29,7 +29,7 @@ QUANTILES = [0.5, 0.2, 0.8]
 
 @dataclass
 class SingleBenchmarkRunInput:
-    x: Union[int, float]
+    x: Union[int, float, str]
     kernel_provider: str
     kernel_operation_mode: Optional[str] = ""
     extra_benchmark_config: Optional[Dict[str, Any]] = None
@@ -59,7 +59,7 @@ class BenchmarkData:
     gpu_name: str
     x_name: str
     x_label: str
-    x_values: List[float]
+    x_values: List[Union[float, str]]
     y_values_50: List[float]
     y_values_20: List[float]
     y_values_80: List[float]
@@ -79,7 +79,7 @@ class BenchmarkDataCSVRow:
     metric_unit: str
     x_name: str
     x_label: str
-    x_value: float
+    x_value: Union[float, str]
     y_value_50: float
     y_value_20: float
     y_value_80: float
@@ -157,6 +157,17 @@ def run_speed_benchmark(
             rep=rep,
             quantiles=QUANTILES,
         )
+    elif mode == "no-grad-forward":
+
+        def no_grad_forward():
+            with torch.no_grad():
+                fwd_fn()
+
+        ms_50, ms_20, ms_80 = triton.testing.do_bench(
+            no_grad_forward,
+            rep=rep,
+            quantiles=QUANTILES,
+        )
     else:
         raise ValueError(f"Unsupported mode: {mode}. Use 'forward', 'backward', or 'full'.")
     return SingleBenchmarkRunOutput(y_20=ms_20, y_50=ms_50, y_80=ms_80)
@@ -189,6 +200,33 @@ def run_memory_benchmark(
     else:
         raise ValueError(f"Unsupported mode: {mode}. Use 'forward', 'backward', or 'full'.")
     return SingleBenchmarkRunOutput(y_20=mem_20, y_50=mem_50, y_80=mem_80)
+
+
+def default_forward_fn(*setup_out):
+    x, layer = setup_out[0], setup_out[1]
+    return layer(x)
+
+
+def build_speed_bench_fn(
+    setup_fn: Callable[["SingleBenchmarkRunInput"], Any],
+    forward_fn: Callable[..., torch.Tensor] = default_forward_fn,
+) -> Callable:
+    def bench_speed(input: "SingleBenchmarkRunInput") -> SingleBenchmarkRunOutput:
+        setup_out = setup_fn(input)
+        return run_speed_benchmark(lambda: forward_fn(*setup_out), input.kernel_operation_mode, [setup_out[0]])
+
+    return bench_speed
+
+
+def build_memory_bench_fn(
+    setup_fn: Callable[["SingleBenchmarkRunInput"], Any],
+    forward_fn: Callable[..., torch.Tensor] = default_forward_fn,
+) -> Callable:
+    def bench_memory(input: "SingleBenchmarkRunInput") -> SingleBenchmarkRunOutput:
+        setup_out = setup_fn(input)
+        return run_memory_benchmark(lambda: forward_fn(*setup_out), input.kernel_operation_mode)
+
+    return bench_memory
 
 
 def get_current_file_directory() -> str:
@@ -341,7 +379,7 @@ def run_benchmarks(
     metric_unit: str,
     x_name: str,
     x_label: str,
-    x_values: List[Union[float, int]],
+    x_values: List[Union[float, int, str]],
     kernel_providers: List[str],
     kernel_operation_modes: Optional[List[str]] = [None],
     extra_benchmark_configs: Optional[List[Dict[str, Any]]] = None,
@@ -426,6 +464,17 @@ def parse_benchmark_script_args():
         help="Flag to overwrite existing benchmark data with current run.",
     )
     parser.add_argument(
+        "--sweep-mode",
+        type=str,
+        default="token_length",
+        choices=["token_length", "model_config"],
+        help=(
+            "Benchmark sweep dimension. "
+            "'token_length': sweep sequence length with fixed model. "
+            "'model_config': sweep model configs with fixed token length."
+        ),
+    )
+    parser.add_argument(
         "--model",
         type=str,
         default=None,
@@ -433,6 +482,15 @@ def parse_benchmark_script_args():
             "Model config name from MODEL_REGISTRY "
             "(e.g. llama_2_7b, llama_3_8b). "
             "Defaults to llama_3_8b when not specified."
+        ),
+    )
+    parser.add_argument(
+        "--bt",
+        type=int,
+        default=2048,
+        help=(
+            "Target total tokens (batch_size * seq_len) for model-config "
+            "sweep. Only used when --sweep-mode=model_config."
         ),
     )
     args = parser.parse_args()
